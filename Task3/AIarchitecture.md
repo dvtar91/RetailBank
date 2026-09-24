@@ -15,131 +15,122 @@
 #### Container‑diagram для флагмана (инициатива F)  
 
 ```mermaid
-graph TB
-    %% Блоки
-    subgraph "RetailBank Core"
-        direction TB
-        DB[(Database<br/>Операционные<br/>источники, справочники)]
-        AML[AML Platform<br/>KYC, внешние сигналы]
-        FE[Frontend / API<br/>Внутренняя система мониторинга]
-    end
+C4Context
+title RetailBank – Флагман: Выявление подозрительных операций
 
-    subgraph "AI Service"
-        direction TB
-        Queue[Message Queue<br/>Kafka / RabbitMQ]
-        FeatureService[Feature Extraction Service<br/>deterministic (Scala/Java)]
-        ScoringModel[ML Scoring Model<br/>XGBoost / LightGBM]
-        Calibration[Calibration & Threshold Service]
-        RulesEngine[Deterministic Rules Engine<br/>Drools / custom]
-        HumanReview[Human Review UI<br/>Web‑app (25 analysts)]
-    end
+Person(customer, "Клиент")
+System_Boundary(rb, "RetailBank Core") {
+    Container(Db, "Database", "PostgreSQL", "Операционные данные, справочники")
+    Container(AmlPlatform, "AML Platform", "REST/GRPC", "KYC, внешние рисковые сигналы")
+    Container(Frontend, "Frontend / API", "Spring Boot/Node", "Внутренний API мониторинга")
+}
+System_Boundary(ai, "AI Service") {
+    Container(Queue, "Message Queue", "Kafka", "Очередь запросов на проверку")
+    Container(FeatureService, "Feature Extraction Service", "Java/Scala", "Детерминированное формирование признаков")
+    Container(ScoringModel, "ML Scoring Model", "Python (XGBoost)", "Обученная модель скоринга")
+    Container(Calibration, "Calibration & Threshold Service", "Java", "Калибровка, пороги, стресс‑тест")
+    Container(RulesEngine, "Deterministic Rules Engine", "Drools", "Бизнес‑правила AML")
+    Container(HumanReviewUI, "Human Review UI", "React", "Экран аналитиков")
+}
 
-    %% Связи
-    FE -->|Запрос на проверку операции| Queue
-    Queue --> FeatureService
-    FeatureService -->|features (JSON)| ScoringModel
-    ScoringModel -->|rawScore| Calibration
-    Calibration -->|decision (accept/hold/alert)| RulesEngine
-    RulesEngine -->|finalDecision| FE
-    RulesEngine -->|при отклонении| HumanReview
-    HumanReview -->|подтверждённый verdict| FE
+Rel(customer, Frontend, "Отправка операции / запрос")
+Rel(Frontend, Queue, "POST /risk‑check")
+Rel(Queue, FeatureService, "Получить задачу")
+Rel(FeatureService, ScoringModel, "JSON‑features")
+Rel(ScoringModel, Calibration, "rawScore")
+Rel(Calibration, RulesEngine, "decision (accept/hold/reject)")
+Rel(RulesEngine, Frontend, "finalDecision")
+Rel(RulesEngine, HumanReviewUI, "hold → запрос проверки")
+Rel(HumanReviewUI, Frontend, "подтверждённый verdict")
+Rel(FeatureService, Db, "загрузка операций")
+Rel(FeatureService, AmlPlatform, "загрузка AML‑сигналов")
+Rel(RulesEngine, Db, "история решений")
 
-    %% Сторонние сервисы
-    AML -->|RiskScore, watch‑lists| FeatureService
-    DB -->|операционные данные| FeatureService
-    DB -.->|история решений| RulesEngine
 ```  
 
-#### omponent‑diagram для флагмана  
+#### Сomponent‑diagram для флагмана  
 
 ```mermaid
-graph LR
-    %% External entry
-    API[REST API «/risk‑check»] --> Queue
+C4Container
+title RetailBank – Компоненты AI‑сервиса (Флагман)
 
-    %% Queue
-    Queue --> FeatureExtractor
-    Queue --> HumanReviewTrigger
+Container_Boundary(ai, "AI Service") {
+    Component(API, "REST API «/risk‑check»", "Spring/Node", "Приём запросов")
+    Component(Queue, "Message Queue", "Kafka", "Буфер запросов")
+    Component(FeatureExtractor, "Feature Extraction", "Java/Scala", "Загрузка данных, объединение, сериализация")
+    Component(ScoringModel, "ML Scoring Model", "Python (XGBoost)", "Прогноз риска")
+    Component(Calibration, "Calibration & Threshold", "Java", "Калибровка, пороговое решение")
+    Component(RulesEngine, "Rules Engine", "Drools", "Бизнес‑правила AML")
+    Component(HumanRouter, "Human Review Trigger", "Java", "Определение необходимости human‑in‑the‑loop")
+    Component(HumanUI, "Human Review UI", "React", "Экран аналитика")
+    Component(Monitoring, "Monitoring", "Prometheus/Loki", "Метрики, алерты")
+}
 
-    %% Feature extraction (deterministic)
-    subgraph FeatureExtractor
-        direction TB
-        LoadOps[Load operation data]
-        LoadAML[Load AML signals]
-        Join[Join & enrich features]
-        Serialize[Serialize to JSON]
-    end
+Rel(API, Queue, "enqueue request")
+Rel(Queue, FeatureExtractor, "consume")
+Rel(FeatureExtractor, ScoringModel, "features JSON")
+Rel(ScoringModel, Calibration, "rawScore")
+Rel(Calibration, RulesEngine, "decision")
+Rel(RulesEngine, HumanRouter, "hold? / confidence")
+Rel(HumanRouter, HumanUI, "display for review")
+Rel(HumanUI, RulesEngine, "human verdict")
+Rel(RulesEngine, API, "finalDecision")
+Rel(Monitoring, FeatureExtractor, "metrics")
+Rel(Monitoring, ScoringModel, "metrics")
+Rel(Monitoring, RulesEngine, "metrics")
+Rel(Monitoring, HumanUI, "metrics")
 
-    %% ML scoring
-    Serialize --> ScoringModel
-    ScoringModel --> Calibration
-    Calibration --> DecisionRouter
-
-    %% Rules & fallback
-    DecisionRouter --> RulesEngine
-    DecisionRouter -->|low confidence| HumanReviewTrigger
-
-    %% Human loop
-    HumanReviewTrigger --> HumanReviewUI
-    HumanReviewUI --> HumanDecision[Human verdict]
-    HumanDecision --> DecisionRouter
-
-    %% Output to core banking
-    DecisionRouter -->|accept| AcceptResponse[API response 200]
-    DecisionRouter -->|hold| HoldResponse[API response 202 + taskId]
-    DecisionRouter -->|reject| RejectResponse[API response 403]
-
-    %% Monitoring
-    Monitoring[Prometheus + Loki] -->|metrics| FeatureExtractor
-    Monitoring --> ScoringModel
-    Monitoring --> RulesEngine
-    Monitoring --> HumanReviewUI
 ```  
 
 #### Container‑diagram для инициатив **A** (оцифровка документов) и **B** (маршрутизация обращений)  
 
 
 ```mermaid
-graph TB
-    subgraph "RetailBank Core"
-        DB[(DB: Операции, заявки, справочники)]
-        AML[AML/KYC Platform]
-        Front[Frontend / API]
-    end
+C4Context
+title RetailBank – Поддержка инициатив A и B
 
-    subgraph "AI Service – Docs (A)"
-        DocQueue[Message Queue – Docs]
-        OCRService[OCR (Tesseract / Azure OCR)]
-        NLPExtractor[NLP Extraction (BERT)]
-        DocValidator[Deterministic Validation Rules]
-        DocHuman[Human Review UI – Docs]
-    end
+Person(customer, "Клиент")
+System_Boundary(rb, "RetailBank Core") {
+    Container(Db, "Database", "PostgreSQL", "Операционные данные, справочники")
+    Container(AmlPlatform, "AML/KYC Platform", "REST", "Внешние сигналы риска")
+    Container(Frontend, "Frontend / API", "Spring/Node", "Входные каналы (загрузка, чат, форма)")
+}
 
-    subgraph "AI Service – Routing (B)"
-        MsgQueue[Message Queue – Requests]
-        TextPreproc[Text Pre‑processing]
-        Classifier[ML Classifier (FastText / RoBERTa)]
-        RoutingRules[Deterministic Routing Rules]
-        RoutingHuman[Human Review UI – Routing]
-    end
+System_Boundary(aiDocs, "AI Service – Документы (A)") {
+    Container(DocQueue, "Message Queue – Docs", "Kafka", "Точки входа для файлов")
+    Container(OCRService, "OCR Service", "Azure OCR / Tesseract", "Распознавание изображений")
+    Container(NLPExtractor, "NLP Extraction", "Python (BERT)", "Извлечение полей из текста")
+    Container(DocValidator, "Deterministic Validation Rules", "Java", "Схемы, контроль обязательных полей")
+    Container(DocHumanUI, "Human Review UI – Docs", "React", "Экран операторов")
+}
 
-    %% Flows Docs
-    Front -->|upload doc| DocQueue
-    DocQueue --> OCRService --> NLPExtractor --> DocValidator
-    DocValidator -->|high confidence| Front
-    DocValidator -->|low confidence| DocHuman -->|approval| Front
+System_Boundary(aiRouting, "AI Service – Маршрутизация (B)") {
+    Container(MsgQueue, "Message Queue – Requests", "Kafka", "Очередь запросов от UI")
+    Container(TextPreproc, "Text Pre‑processing", "Java", "Токенизация, очистка")
+    Container(Classifier, "ML Classifier", "Python (FastText)", "Классификация запросов")
+    Container(RoutingRules, "Deterministic Routing Rules", "Drools", "Правила роутинга")
+    Container(RoutingHumanUI, "Human Review UI – Routing", "React", "Экран оператора")
+}
 
-    %% Flows Routing
-    Front -->|incoming request| MsgQueue
-    MsgQueue --> TextPreproc --> Classifier --> RoutingRules
-    RoutingRules -->|auto route| Front
-    RoutingRules -->|needs review| RoutingHuman -->|decision| Front
+Rel(customer, Frontend, "Загружает документ / отправляет запрос")
+Rel(Frontend, DocQueue, "POST /documents")
+Rel(Frontend, MsgQueue, "POST /requests")
+Rel(DocQueue, OCRService, "consume")
+Rel(OCRService, NLPExtractor, "text")
+Rel(NLPExtractor, DocValidator, "extracted fields")
+Rel(DocValidator, Frontend, "auto‑accept")
+Rel(DocValidator, DocHumanUI, "low confidence / error")
+Rel(DocHumanUI, Frontend, "approved / corrected")
+Rel(MsgQueue, TextPreproc, "consume")
+Rel(TextPreproc, Classifier, "clean text")
+Rel(Classifier, RoutingRules, "predicted queue")
+Rel(RoutingRules, Frontend, "auto‑route")
+Rel(RoutingRules, RoutingHumanUI, "need review")
+Rel(RoutingHumanUI, Frontend, "final decision")
+Rel(OCRService, Db, "optional metadata")
+Rel(NLPExtractor, AmlPlatform, "risk signals")
+Rel(Classifier, AmlPlatform, "risk signals")
 
-    %% Shared services
-    DB --> OCRService
-    DB --> TextPreproc
-    AML --> NLPExtractor
-    AML --> Classifier
 ```  
 
 ---
