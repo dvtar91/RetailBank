@@ -5,10 +5,10 @@
 ### Общее содержание  
 
 | Инициатива | Тип решения | Краткое описание | Статус |
-|------------|------------|------------------|-----------------|
-| **F** – Выявление подозрительных операций (транзит, обналичивание, дробление) | Табличный скоринг + правила AML | Конвейер **признаки → модель → калибровка/порог → детерминированные правила → human‑in‑the‑loop** | Готово (C4‑диаграммы, таблицы, контракт, fallback, мониторинг, угрозы) |
-| **A** – OCR‑оцифровка документов к кредитной заявке | OCR + NLP‑extraction + валидация | **Документ → OCR → NLP‑extraction → проверка схемы → human‑review (при низкой уверенности/ошибке)** | Готово (Container‑диаграмма, контракт, fallback, мониторинг) |
-| **B** – Прогноз оттока клиентов | Текстовый классификатор + правила роутинга | **Текст → предобработка → классификатор → правила → human‑review, если необходимо** | Готово (Container‑диаграмма, контракт, fallback, мониторинг) |
+|------------|------------|------------------|--------|
+| **F** – Выявление подозрительных операций (транзит, обналичивание, дробление) | Табличный скоринг + правила AML | **Конвейер «признаки → модель → калибровка/порог → детерминированные правила → human‑in‑the‑loop»** (модель выдаёт лишь приоритет, окончательное решение принимает Rules Engine). | Готово (C4‑диаграммы, таблицы, контракт, fallback, мониторинг, угрозы) |
+| **A** – OCR‑оцифровка документов к кредитной заявке | OCR + NLP‑extraction + валидация | **Документ → OCR → NLP‑extraction → проверка схемы → human‑review (при низкой уверенности/ошибке)** | Готово (Container‑диаграмма, контракт, fallback, мониторинг) |
+| **B** – Прогноз оттока клиентов | Пакетный табличный скоринг + детерминированные правила | **Ежедневный batch‑job → вычисление признаков → модель → таблица прогнозов → Rules Engine → human‑review (при low‑confidence)** | **Обновлено** (batch‑архитектура, on‑prem хранение, согласовано с ADR) |
 
 ---
 
@@ -27,10 +27,10 @@ System_Boundary(rb, "RetailBank Core") {
     Container(API, "Frontend / API", "Spring Boot / Node", "Внутренний API мониторинга")
 }
 System_Boundary(ai, "AI Service") {
-    Container(Queue, "Message Queue", "Kafka", "Буфер запросов на проверку")
+    Container(Queue, "Message Queue", "Kafka", "Буфер запросов")
     Container(FeatureSrv, "Feature Extraction Service", "Java/Scala", "Формирование детерминированных признаков")
-    Container(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Расчёт `riskScore` (0‑1) и `priorityScore`")
-    Container(Rules, "Deterministic Rules Engine", "Drools", "Бизнес‑правила AML (не используют пороги модели) ")
+    Container(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Расчёт `riskScore` (0‑1) и `priorityScore` (0‑100)")
+    Container(Rules, "Deterministic Rules Engine", "Drools", "Бизнес‑правила AML (не используют пороги модели)")
     Container(HumanUI, "Human Review UI", "React", "Экран аналитика")
 }
 Rel(customer, API, "Отправка операции")
@@ -39,7 +39,7 @@ Rel(Queue, FeatureSrv, "Consume")
 Rel(FeatureSrv, Db, "Read ops + справочники")
 Rel(FeatureSrv, KYC, "Pull risk signals")
 Rel(FeatureSrv, ScoreModel, "JSON‑features")
-Rel(ScoreModel, Rules, "riskScore + priorityScore")
+Rel(ScoreModel, Rules, "riskScore + priorityScore")
 Rel(Rules, API, "finalDecision (accept / reject / hold)")
 Rel(Rules, HumanUI, "hold / low‑confidence → запрос проверки")
 Rel(HumanUI, API, "humanVerdict")
@@ -104,33 +104,33 @@ Rel(OCRSrv, Db, "optional metadata")
 Rel(NLPExtract, Db, "store extracted fields")
 ```
 
-#### Инициатива B – Прогноз оттока клиентов (Churn)  
+#### Инициатива B – Прогноз оттока клиентов (butch, on-prem)
 
 ```mermaid
 C4Context
-title RetailBank – Прогноз оттока клиентов (инициатива B)
+title RetailBank – Прогноз оттока клиентов (batch, on‑prem)
 
-Person(customer, "Клиент")
+Person(analyst, "Аналитик / Маркетолог")
 System_Boundary(rb, "RetailBank Core") {
-    Container(API, "Frontend / API", "Spring / Node", "Приём события/профиля клиента")
+    Container(Db, "Операционная БД (on‑prem)", "PostgreSQL", "Клиентские события, исторические признаки")
+    Container(Scheduler, "Batch Scheduler (Airflow / Cron)", "Scheduler", "Запускает batch‑job каждый день")
 }
-System_Boundary(aiChurn, "AI Service – Churn") {
-    Container(ChurnQueue, "Message Queue – Churn", "Kafka", "Очередь запросов на прогноз оттока")
-    Container(Preproc, "Feature Service – Churn", "Java", "Подготовка признаков (агр., нормал.)")
-    Container(ChurnModel, "ML Churn Model", "Python (XGBoost)", "Прогноз вероятности оттока")
-    Container(ChurnRules, "Deterministic Churn Rules", "Drools", "Правила бизнес‑приоритетов (VIP, регуляция)")
-    Container(ChurnHumanUI, "Human Review UI – Churn", "React", "Экран аналитика при low‑confidence")
+System_Boundary(aiChurn, "AI Service – Churn (on‑prem)") {
+    Container(ETL, "ETL / Feature Builder", "Spark / SQL", "Генерирует набор признаков за 24 ч")
+    Container(ChurnModel, "Batch ML Model", "Python (XGBoost)", "Обучает/прогнозирует отток")
+    Container(PredTable, "Churn Predictions Table", "PostgreSQL", "Хранит `churnProbability`, `confidence`")
+    Container(Rules, "Deterministic Rules Engine", "Drools", "Правила бизнес‑приоритетов (VIP, регуляция)")
+    Container(HumanUI, "Human Review UI – Churn", "React", "Экран аналитика: список low‑confidence")
 }
-Rel(customer, API, "POST /customer‑event")
-Rel(API, ChurnQueue, "enqueue request")
-Rel(ChurnQueue, Preproc, "consume")
-Rel(Preproc, ChurnModel, "features JSON")
-Rel(ChurnModel, ChurnRules, "prediction + confidence")
-Rel(ChurnRules, API, "auto‑route")
-Rel(ChurnRules, ChurnHumanUI, "hold / low confidence")
-Rel(ChurnHumanUI, API, "final decision")
+Rel(analyst, Scheduler, "Запускает batch‑job (daily)")
+Rel(Scheduler, ETL, "trigger")
+Rel(ETL, Db, "читает клиентские события")
+Rel(ETL, ChurnModel, "передаёт признаки")
+Rel(ChurnModel, PredTable, "записывает прогноз")
+Rel(PredTable, Rules, "чтение прогнозов")
+Rel(Rules, HumanUI, "hold / low‑confidence → список для review")
+Rel(HumanUI, Db, "записывает действия retention")
 ```
-
 ---
 
 ### Таблица ответственности компонентов (RACI)
@@ -164,8 +164,8 @@ Rel(ChurnHumanUI, API, "final decision")
   "requestId": "string (uuid)",
   "operationId": "string",
   "decision": "enum[queued, accept, reject, hold]",
-  "riskScore": "number (0‑1)",               // вывод модели – используется только для аналитики
-  "priorityScore": "number (0‑100)",          // скалированный риск, определяет порядок в очереди
+  "riskScore": "number (0‑1)",
+  "priorityScore": "number (0‑100)",
   "modelVersion": "string",
   "featuresUsed": ["list of feature names"],
   "ruleTriggers": ["list of rule identifiers (optional)"],
@@ -185,7 +185,6 @@ Rel(ChurnHumanUI, API, "final decision")
     "queueDelayMs": "integer"
   }
 }
-
 ```
 
 *Обязательные поля:* `requestId, operationId, decision, score, modelVersion, timestamp, source`.  
@@ -215,23 +214,28 @@ Rel(ChurnHumanUI, API, "final decision")
 
 *Если `confidence < 0.8` **или** обнаружены конфликты полей → `humanReviewRequired: true`.*
 
-#### Прогноз оттока (Churn)  
+#### Прогноз оттока (batch-контракт)  
 
 ```json
 {
-  "requestId": "string (uuid)",
-  "customerId": "string",
-  "predictedProbability": "number (0‑1)",
-  "confidence": "number (0‑1)",
-  "modelVersion": "string",
-  "ruleApplied": "boolean",
-  "humanReviewRequired": "boolean",
-  "humanDecision": "enum[retain, ignore, escalated] | null",
-  "timestamp": "ISO‑8601"
+  "batchId": "string (uuid)",
+  "runTimestamp": "ISO‑8601",
+  "predictionCount": "integer",
+  "predictions": [
+    {
+      "customerId": "string",
+      "churnProbability": "number (0‑1)",
+      "confidence": "number (0‑1)",
+      "ruleApplied": "boolean",
+      "humanReviewRequired": "boolean"
+    }
+    // … может быть до сотен тысяч записей
+  ],
+  "status": "enum[success, partial_failure, failure]",
+  "errorDetails": "string (optional)"
 }
 ```
-
-*Если `confidence < 0.6` **или** правило «VIP‑клиент» конфликтует с прогнозом → `humanReviewRequired: true`.*
+*Если humanReviewRequired = true – запись попадёт в Human Review UI для дальнейшего подтверждения/корректировки.*
 
 ---
 
@@ -250,37 +254,40 @@ Rel(ChurnHumanUI, API, "final decision")
 
 | № | Признак отклонения | Действие | Куда направляется |
 |---|--------------------|----------|-------------------|
-| **1** | **Отсутствие/устаревание признаков** (FeatureValidator) | `humanReviewRequired = true` → **Human Review UI** | Human Review UI |
-| **2** | **Out‑of‑distribution (OOD)‑детекция** (признаки за пределами обучающего диапазона) | Пометить `humanReviewRequired = true`, но сохранить `priorityScore` | Human Review UI |
-| **3** | **Новый клиент без истории** | Увеличить порог `priorityScore` = 80 → Human Review | Human Review UI |
-| **4** | **Зона «зазор»** (`priorityScore` ∈ [70‑80]) | Требовать подтверждения человека | Human Review UI |
-| **5** | **Разногласие модели и детерминированного правила** | Приоритет правил → **Rule‑Only** (не зависимо от `riskScore`) | Rules Engine (автоматическое `accept`/`reject`/`hold`) |
-| **6** | **Недоступность модели / сервиса** | Переключить в **Rule‑Only** режим | Rules Engine |
-| **7** | **Неверный JSON‑ответ модели** | `400 Bad Request`, логировать | API‑клиент |
-| **8** | **OCR‑схема не прошла валидацию** | Human Review (показ оригинала + извлечённые поля) | Doc Human Review UI |
-| **9** | **Противоречивые документы** | Human Review с пометкой «конфликт» | Doc Human Review UI |
-| **10** | **Запрос вне области применимости (Churn)** | `403 Forbidden` + ссылка на справку | API‑клиент |
-| **11** | **Отказ внешнего сервиса (KYC, OCR SaaS)** | Перейти в **offline‑mode** → только локальные правила | Rules Engine |
-| **12** | **Превышение лимитов очереди** | Дрейн‑режим: новые запросы сразу в Human Review | Human Review UI |
-| **13** | **Обнаружена XSS/малициозный файл (OCR)** | Блокировать, вернуть `415 Unsupported Media Type` | API‑клиент |
+| 1 | Отсутствие/устаревание признаков (FeatureValidator) | `humanReviewRequired = true` → **Human Review UI** | Human Review UI |
+| 2 | OOD‑detекция признаков | `humanReviewRequired = true` (при сохранении `priorityScore`) | Human Review UI |
+| 3 | Новый клиент без истории | `priorityScore = 80` → **Human Review** | Human Review UI |
+| 4 | Зона «зазор» (`priorityScore` ∈ [70‑80]) | Требовать подтверждения | Human Review UI |
+| 5 | Конфликт модели и правила (Churn) | Приоритет правила → **Rule‑Only** (автоматическое `accept`/`reject` без модели) | Rules Engine |
+| 6 | Недоступность модели/сервиса (любая инициатива) | Переключить в **Rule‑Only** режим | Rules Engine |
+| 7 | Неверный JSON‑ответ модели | `400 Bad Request`, логировать | API‑клиент |
+| 8 | OCR‑схема не прошла валидацию | **Human Review** (показ оригинала + поля) | Doc Human Review UI |
+| 9 | Противоречивые документы | **Human Review** с пометкой «конфликт» | Doc Human Review UI |
+| 10 | Запрос вне области применимости (Churn) | `403 Forbidden` + ссылка на справку | API‑клиент |
+| 11 | Отказ внешнего сервиса (KYC, OCR SaaS) | **offline‑mode** – только локальные правила | Rules Engine |
+| 12 | Превышение лимитов очереди | Дрейн‑режим → новые запросы сразу в **Human Review** | Human Review UI |
+| 13 | XSS/малициозный файл (OCR) | Блокировать, вернуть `415 Unsupported Media Type` | API‑клиент |
 
 ---
 
 ### План мониторинга  
 
 | Уровень | Метрика | Порог тревоги | Действие |
-|----------|---------|---------------|----------|
-| **API** | `request_rate`, `error_rate (4xx/5xx)` | > 200 req/s, > 2 % 5xx | Авто‑скейлинг, алерт SRE |
-| **Очереди** | `queue_length`, `lag_ms` | > 10 000 сообщений, `lag_ms > 5 000` | Увеличить concurrency, алерт |
-| **Feature Extraction** | `extraction_time_ms`, `missing_features_rate` | > 200 ms, > 5 % missing | Перезапуск, проверка источников |
-| **FeatureValidator / OOD** | `featureValidatorErrors`, `oodDetectionRate` | > 2 % всего | Алерт, эскалация к Data‑Science |
-| **ML Model** | `model_latency_ms`, `priorityScoreDistribution`, `drift_score (PSI)` | > 150 ms, priorityScore > 80 % запросов, PSI > 0.1 | Перевести модель в **read‑only**, запустить пере‑обучение |
-| **Rules Engine** | `rule_trigger_rate`, `rule_reject_rate` | > 30 % hold‑rate, > 40 % reject‑rate без human‑review | Пересмотр бизнес‑правил |
-| **Human Review** | `avg_review_time`, `queue_backlog_human`, `escalation_rate` | > 15 min, backlog > 500, escalations > 10 % | Поднять staffing, пересмотреть SLA |
-| **Бизнес‑метрики** | `falsePositiveRate`, `falseNegativeRate`, `blocked_transactions_per_month` | FP > 3 %, FN > 1 % | Пересчитать ROI, откат модели |
-| **Безопасность** | `sensitive_data_leak_events`, `unauthorized_access_attempts` | > 0 | Инцидент‑процесс, немедленная блокировка |
+|--------|---------|---------------|----------|
+| API | `request_rate`, `error_rate (4xx/5xx)` | > 200 req/s, > 2 % 5xx | Авто‑скейлинг, алерт SRE |
+| Очереди | `queue_length`, `lag_ms` | > 10 000 сообщений, `lag_ms > 5 000` | Увеличить concurrency, алерт |
+| Feature Extraction | `extraction_time_ms`, `missing_features_rate` | > 200 ms, > 5 % missing | Перезапуск, проверка источников |
+| FeatureValidator / OOD | `featureValidatorErrors`, `oodDetectionRate` | > 2 % всего | Алерт, эскалация к Data‑Science |
+| **Batch Scheduler (Churn)** | `job_success_rate` (за последние 7 дн) | < 95 % | Алерт, автоматический retry |
+| **ETL / Feature Builder** | `rows_processed / rows_expected` | < 98 % | Алерт, проверка источников |
+| **ML Model (Churn)** | `drift_score (PSI)` | > 0.1 | Перевести модель в **read‑only**, запустить пере‑обучение |
+| **Predictions (Churn)** | `low_confidence_rate` (`confidence < 0.6`) | > 20 % | Информировать бизнес о качестве модели |
+| Rules Engine | `rule_trigger_rate`, `rule_reject_rate` | > 30 % hold‑rate, > 40 % reject‑rate без human‑review | Пересмотр бизнес‑правил |
+| Human Review | `avg_review_time`, `queue_backlog_human`, `escalation_rate` | > 15 min, backlog > 500, escalations > 10 % | Добавить операторов, пересмотреть SLA |
+| Бизнес‑метрики | `falsePositiveRate`, `falseNegativeRate`, `blocked_transactions_per_month` | FP > 3 %, FN > 1 % | Пересчитать ROI, возможный откат модели |
+| Безопасность | `sensitive_data_leak_events`, `unauthorized_access_attempts` | > 0 | Инцидент‑процесс, немедленная блокировка |
 
-*Автоматический откат* – если `drift_score` превышает порог, система переводит модель в **read‑only**, генерирует задачу пере‑обучения и **переключает поток** на **Rule‑Only** режим (см. fallback № 6).  
+*Автоматический откат:* при превышении `drift_score` система переводит модель в **read‑only**, генерирует задачу пере‑обучения и переключает поток на **Rule‑Only** (см. fallback № 6).
 
 ---
 
@@ -303,9 +310,10 @@ Rel(ChurnHumanUI, API, "final decision")
 
 | Пункт | Вывод |
 |-------|-------|
-| **Модель** | **Только приоритет** (riskScore + priorityScore).  Нет автоматических `reject`/`accept`. |
-| **Бизнес‑правила** | Остаются **единственным** источником окончательного решения; они могут переопределять модельный риск. |
-| **Human‑review** | Срабатывает при **низкой уверенности**, **OOD‑детекции**, **высоком приоритете** или **отсутствии признаков**. |
-| **Мониторинг** | Добавлен контроль `priorityScoreDistribution` и `oodDetectionRate`. |
-| **Риски** | Привязаны к границам доверия (пунктирные линии).  Меры (TLS, HMAC, sandbox, валидация) уже реализованы. |
-| **Тестирование** | Пилотный запуск в режиме **shadow‑mode**: модель генерирует приоритет, но решения принимаются только правилами и human‑review.  После подтверждения KPI (корректность приоритета, отсутствие роста FN) – полное включение модели в прод. |
+| **Модель** | **Только приоритет** (`riskScore` + `priorityScore` для Флагмана; `churnProbability` + `confidence` для Churn). **Не принимает окончательное `reject/accept`.** |
+| **Бизнес‑правила** | Оставшиеся **единственные** источники окончательного решения; могут переопределять любые выводы модели. |
+| **Human‑review** | Срабатывает при **низкой уверенности**, **OOD‑детекции**, **высоком приоритете** (Флагман) и при **low‑confidence**/правильных исключениях (Churn). |
+| **Размещение** | Все три инициативы **on‑prem** (или гибрид с GPU‑контуром в РФ). Для Churn — полностью on‑prem, без облачных сервисов. |
+| **Batch‑прогноз** | Прогноз оттока теперь **ежедневный batch‑job**; результаты сохраняются в локальной таблице и обрабатываются Rules Engine → Human Review UI. |
+| **Мониторинг** | Добавлен контроль за batch‑job (успешность, drift, low‑confidence). |
+| **Тестирование** | Пилотный запуск в *shadow‑mode* (модель генерирует приоритет/прогноз, но решения принимаются только правилами и human‑review). После подтверждения KPI (корректность приоритета, отсутствие роста FN) – полное включение в прод. |
