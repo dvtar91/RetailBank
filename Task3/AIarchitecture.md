@@ -11,12 +11,8 @@
 | **B** – Прогноз оттока клиентов | Текстовый классификатор + правила роутинга | **Текст → предобработка → классификатор → правила → human‑review, если необходимо** | Готово (Container‑диаграмма, контракт, fallback, мониторинг) |
 
 ---
-## Решение 3 – Разработка архитектуры AI‑сервиса для **RetailBank**  
-*(директория `Task3` вашего репозитория)*  
 
----
-
-### Обновлённые контейнерные и компонентные C4‑диаграммы  
+### Контейнерные и компонентные C4‑диаграммы  
 
 #### Флагман — Выявление подозрительных операций (табличный скоринг)  
 
@@ -26,16 +22,15 @@ title RetailBank – Флагман: Выявление подозрительн
 
 Person(customer, "Клиент")
 System_Boundary(rb, "RetailBank Core") {
-    Container(Db, "Операционная БД", "PostgreSQL", "Операции, справочники, KYC‑данные")
+    Container(Db, "Операционная БД", "PostgreSQL", "Транзакции, справочники, KYC‑данные")
     Container(KYC, "Внешняя KYC‑платформа", "REST (TLS)", "Риски клиента, статусы")
     Container(API, "Frontend / API", "Spring Boot / Node", "Внутренний API мониторинга")
 }
 System_Boundary(ai, "AI Service") {
     Container(Queue, "Message Queue", "Kafka", "Буфер запросов на проверку")
     Container(FeatureSrv, "Feature Extraction Service", "Java/Scala", "Формирование детерминированных признаков")
-    Container(Model, "ML Scoring Model", "Python (LightGBM)", "Счётчик риска")
-    Container(Calib, "Calibration & Threshold Service", "Java", "Калибровка, пороги, зоны «зазор»")
-    Container(Rules, "Deterministic Rules Engine", "Drools", "Бизнес‑правила AML")
+    Container(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Расчёт `riskScore` (0‑1) и `priorityScore`")
+    Container(Rules, "Deterministic Rules Engine", "Drools", "Бизнес‑правила AML (не используют пороги модели) ")
     Container(HumanUI, "Human Review UI", "React", "Экран аналитика")
 }
 Rel(customer, API, "Отправка операции")
@@ -43,11 +38,10 @@ Rel(API, Queue, "POST /risk‑check")
 Rel(Queue, FeatureSrv, "Consume")
 Rel(FeatureSrv, Db, "Read ops + справочники")
 Rel(FeatureSrv, KYC, "Pull risk signals")
-Rel(FeatureSrv, Model, "JSON‑features")
-Rel(Model, Calib, "rawScore")
-Rel(Calib, Rules, "decision (accept/hold/reject)")
-Rel(Rules, API, "finalDecision")
-Rel(Rules, HumanUI, "hold → запрос проверки")
+Rel(FeatureSrv, ScoreModel, "JSON‑features")
+Rel(ScoreModel, Rules, "riskScore + priorityScore")
+Rel(Rules, API, "finalDecision (accept / reject / hold)")
+Rel(Rules, HumanUI, "hold / low‑confidence → запрос проверки")
 Rel(HumanUI, API, "humanVerdict")
 Rel(Rules, Db, "store decision history")
 ```
@@ -60,24 +54,22 @@ Container_Boundary(ai, "AI Service") {
     Component(API, "REST API `/risk‑check`", "Spring/Node", "Приём запросов, валидация JSON")
     Component(Queue, "Message Queue", "Kafka", "Буфер запросов")
     Component(FeatureExtractor, "Feature Extraction", "Java/Scala", "Сбор и агрегирование признаков")
-    Component(ScoringModel, "ML Scoring Model", "Python (LightGBM)", "Прогноз риска (score 0‑1)")
-    Component(Calibration, "Calibration & Threshold", "Java", "Калибровка, пороги, зоны «зазор»")
-    Component(RulesEngine, "Rules Engine", "Drools", "Бизнес‑правила AML")
-    Component(HumanRouter, "Human Review Trigger", "Java", "Определение необходимости human‑in‑the‑loop")
+    Component(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Выдаёт `riskScore` (0‑1) и `priorityScore` (0‑100)")
+    Component(RulesEngine, "Rules Engine", "Drools", "Бизнес‑правила AML (полностью детерминированы)")
+    Component(HumanRouter, "Human Review Trigger", "Java", "Определяет необходимость human‑in‑the‑loop (low‑confidence, OOD, priority > 80)")
     Component(HumanUI, "Human Review UI", "React", "Экран аналитика")
     Component(Monitoring, "Monitoring", "Prometheus/Loki", "Метрики, алерты, трассировка")
 }
 Rel(API, Queue, "enqueue request")
 Rel(Queue, FeatureExtractor, "consume")
-Rel(FeatureExtractor, ScoringModel, "features JSON")
-Rel(ScoringModel, Calibration, "rawScore")
-Rel(Calibration, RulesEngine, "decision")
-Rel(RulesEngine, HumanRouter, "hold? / confidence")
+Rel(FeatureExtractor, ScoreModel, "features JSON")
+Rel(ScoreModel, RulesEngine, "riskScore + priorityScore")
+Rel(RulesEngine, HumanRouter, "hold? / low‑confidence / priority")
 Rel(HumanRouter, HumanUI, "display for review")
 Rel(HumanUI, RulesEngine, "humanVerdict")
 Rel(RulesEngine, API, "finalDecision")
 Rel(Monitoring, FeatureExtractor, "metrics")
-Rel(Monitoring, ScoringModel, "metrics")
+Rel(Monitoring, ScoreModel, "metrics")
 Rel(Monitoring, RulesEngine, "metrics")
 Rel(Monitoring, HumanUI, "metrics")
 ```
@@ -171,8 +163,9 @@ Rel(ChurnHumanUI, API, "final decision")
 {
   "requestId": "string (uuid)",
   "operationId": "string",
-  "decision": "enum[accept, hold, reject]",
-  "score": "number (0‑1)",
+  "decision": "enum[queued, accept, reject, hold]",
+  "riskScore": "number (0‑1)",               // вывод модели – используется только для аналитики
+  "priorityScore": "number (0‑100)",          // скалированный риск, определяет порядок в очереди
   "modelVersion": "string",
   "featuresUsed": ["list of feature names"],
   "ruleTriggers": ["list of rule identifiers (optional)"],
@@ -184,14 +177,15 @@ Rel(ChurnHumanUI, API, "final decision")
     "kcySignalIds": ["array of ids"]
   },
   "validation": {
-    "schemaValid": "boolean",
-    "missingFields": ["array (optional)"]
+    "featuresValid": "boolean",
+    "missingFeatures": ["array (optional)"]
   },
   "audit": {
     "processingTimeMs": "integer",
     "queueDelayMs": "integer"
   }
 }
+
 ```
 
 *Обязательные поля:* `requestId, operationId, decision, score, modelVersion, timestamp, source`.  
@@ -256,19 +250,19 @@ Rel(ChurnHumanUI, API, "final decision")
 
 | № | Признак отклонения | Действие | Куда направляется |
 |---|--------------------|----------|-------------------|
-| **1** | Отсутствие/устаревание признаков (F) | `hold` + лог | Human Review UI |
-| **2** | Значения за пределами обучающей выборки (score > 0.95 или < 0.05) | Авто‑`reject`/`accept` + аудит | Финальная система |
-| **3** | Новый клиент без истории | Увеличить порог, запрос в Human Review | Human Review UI |
-| **4** | Зона «зазор» (score ∈ [0.45‑0.55]) | Требовать подтверждение человека | Human Review UI |
-| **5** | Расхождение модели и правила | Приоритет правила → автоматический отказ + лог | Финальная система |
-| **6** | Недоступность модели/сервиса | Переключить на **Rule‑only** режим | Rules Engine → `accept`/`hold` |
-| **7** | Неверный JSON‑ответ модели | `400 Bad Request`, лог | API‑клиент |
-| **8** | OCR‑схема не пройдена (ошибки структуры) | Human Review (показ оригинала + извлечённые поля) | Doc Human Review UI |
-| **9** | Противоречивые документы (разные версии полей) | Human Review с пометкой «конфликт» | Doc Human Review UI |
-| **10** | Запрос вне области применения (Churn) | `403 Forbidden` + ссылка на справку | API‑клиент |
-| **11** | Отказ внешнего сервиса (KYC, OCR SaaS) | Перейти в «offline‑mode» → только локальные правила | Rules Engine |
-| **12** | Превышение лимитов очереди | Дрейн‑режим → новые запросы сразу в Human Review | Human Review UI |
-| **13** | Обнаружена XSS/малициозный файл (OCR) | Блокировать, вернуть `415 Unsupported Media Type` | API‑клиент |
+| **1** | **Отсутствие/устаревание признаков** (FeatureValidator) | `humanReviewRequired = true` → **Human Review UI** | Human Review UI |
+| **2** | **Out‑of‑distribution (OOD)‑детекция** (признаки за пределами обучающего диапазона) | Пометить `humanReviewRequired = true`, но сохранить `priorityScore` | Human Review UI |
+| **3** | **Новый клиент без истории** | Увеличить порог `priorityScore` = 80 → Human Review | Human Review UI |
+| **4** | **Зона «зазор»** (`priorityScore` ∈ [70‑80]) | Требовать подтверждения человека | Human Review UI |
+| **5** | **Разногласие модели и детерминированного правила** | Приоритет правил → **Rule‑Only** (не зависимо от `riskScore`) | Rules Engine (автоматическое `accept`/`reject`/`hold`) |
+| **6** | **Недоступность модели / сервиса** | Переключить в **Rule‑Only** режим | Rules Engine |
+| **7** | **Неверный JSON‑ответ модели** | `400 Bad Request`, логировать | API‑клиент |
+| **8** | **OCR‑схема не прошла валидацию** | Human Review (показ оригинала + извлечённые поля) | Doc Human Review UI |
+| **9** | **Противоречивые документы** | Human Review с пометкой «конфликт» | Doc Human Review UI |
+| **10** | **Запрос вне области применимости (Churn)** | `403 Forbidden` + ссылка на справку | API‑клиент |
+| **11** | **Отказ внешнего сервиса (KYC, OCR SaaS)** | Перейти в **offline‑mode** → только локальные правила | Rules Engine |
+| **12** | **Превышение лимитов очереди** | Дрейн‑режим: новые запросы сразу в Human Review | Human Review UI |
+| **13** | **Обнаружена XSS/малициозный файл (OCR)** | Блокировать, вернуть `415 Unsupported Media Type` | API‑клиент |
 
 ---
 
@@ -279,36 +273,39 @@ Rel(ChurnHumanUI, API, "final decision")
 | **API** | `request_rate`, `error_rate (4xx/5xx)` | > 200 req/s, > 2 % 5xx | Авто‑скейлинг, алерт SRE |
 | **Очереди** | `queue_length`, `lag_ms` | > 10 000 сообщений, `lag_ms > 5 000` | Увеличить concurrency, алерт |
 | **Feature Extraction** | `extraction_time_ms`, `missing_features_rate` | > 200 ms, > 5 % missing | Перезапуск, проверка источников |
-| **ML Model** | `model_latency_ms`, `prediction_confidence_distribution`, `drift_score (PSI)` | > 150 ms, confidence‑skew > 0.2, PSI > 0.1 | Перевести модель в **read‑only**, запустить пере‑обучение |
-| **Calibration / Rules** | `rule_trigger_rate`, `threshold_violations` | > 30 % hold‑rate | Пересмотр порогов |
-| **Human Review** | `avg_review_time`, `queue_backlog_human`, `escalation_rate` | > 15 min, backlog > 500, escalations > 10 % | Добавить операторов, пересмотреть SLA |
-| **Бизнес‑метрики** | `FP_rate`, `FN_rate`, `blocked_transactions_per_month` | FP > 3 %, FN > 1 % | Пересчитать стоимость ошибок, откат модели |
+| **FeatureValidator / OOD** | `featureValidatorErrors`, `oodDetectionRate` | > 2 % всего | Алерт, эскалация к Data‑Science |
+| **ML Model** | `model_latency_ms`, `priorityScoreDistribution`, `drift_score (PSI)` | > 150 ms, priorityScore > 80 % запросов, PSI > 0.1 | Перевести модель в **read‑only**, запустить пере‑обучение |
+| **Rules Engine** | `rule_trigger_rate`, `rule_reject_rate` | > 30 % hold‑rate, > 40 % reject‑rate без human‑review | Пересмотр бизнес‑правил |
+| **Human Review** | `avg_review_time`, `queue_backlog_human`, `escalation_rate` | > 15 min, backlog > 500, escalations > 10 % | Поднять staffing, пересмотреть SLA |
+| **Бизнес‑метрики** | `falsePositiveRate`, `falseNegativeRate`, `blocked_transactions_per_month` | FP > 3 %, FN > 1 % | Пересчитать ROI, откат модели |
 | **Безопасность** | `sensitive_data_leak_events`, `unauthorized_access_attempts` | > 0 | Инцидент‑процесс, немедленная блокировка |
 
-*Автоматический повтор* – если `drift_score` превышает порог, система переводит модель в **read‑only**, генерирует задачу пере‑обучения и переключает поток на **Rule‑only** режим.
+*Автоматический откат* – если `drift_score` превышает порог, система переводит модель в **read‑only**, генерирует задачу пере‑обучения и **переключает поток** на **Rule‑Only** режим (см. fallback № 6).  
 
 ---
 
 ### Границы доверия + таблица угроз  
 
-| № | Граница (на схеме) | Тип данных | Угроза | Мера снижения риска |
-|---|----------------------|------------|--------|----------------------|
-| **1** | Frontend → API (внешний запрос) | Неаутентифицированный JSON | Инъекция, DoS, подделка данных | JWT‑подпись, rate‑limiting, JSON‑schema validation |
-| **2** | FeatureSrv ← KYC (внешний REST) | Риск‑сигналы KYC | Подмена/перехват сигнала | TLS 1.3, HMAC подпись запросов, проверка контрольных сумм |
-| **3** | Model ← FeatureSrv (признаки) | Признаки операции | Adversarial‑атака, подмена признаков | HMAC подпись payload, whitelist признаков, контроль целостности |
-| **4** | Calibration ← Model (score) | Оценка модели | Model‑drift, пере‑/недооценка | Мониторинг PSI, автоматический откат версии |
-| **5** | RulesEngine ← Model/Calib (решение) | Решение модели | Rule‑poisoning, конфликт бизнес‑правил | Тест‑suite правил, ограничение прав на изменение |
-| **6** | Client → API (документ) | PDF/JPEG (неструктурированный) | Вредоносный файл, steganography, XSS | Проверка MIME‑type, антивирус‑скан, лимит размера ≤ 10 MB |
-| **7** | OCRSrv ← документ | Необработанное изображение | Оффлайн‑атака, скрытый код | Sandbox‑окружение, ограничение прав процесса OCR |
-| **8** | Classifier ← текст (Churn) | Свободный текст | Prompt‑injection, языковые атаки | Очистка/экранирование, whitelist‑словарей, ограничение длины |
-| **9** | External AML/KYC API → FeatureSrv | Внешний API‑ответ | Перехват/модификация | TLS, API‑ключи с подписью, проверка хэша ответа |
+| № | Граница (на схеме) | Тип данных | Угроза | Мера снижения |
+|---|----------------------|------------|--------|----------------|
+| **1** | Frontend → API (внешний запрос) | Неаутентифицированный JSON | Инъекция, DoS, подделка | JWT‑подпись, rate‑limiting, JSON‑schema validation |
+| **2** | FeatureSrv ← KYC (REST) | Риск‑сигналы KYC | Подмена / перехват | TLS 1.3, HMAC подпись запросов, контрольные суммы |
+| **3** | Model ← FeatureSrv (признаки) | Признаки операции | Adversarial‑атака, подмена | HMAC подпись payload, whitelist признаков, контроль целостности |
+| **4** | RulesEngine ← Model (riskScore + priorityScore) | Вывод модели | Rule‑poisoning, конфликт правил | Тест‑suite правил, ограничение прав изменения |
+| **5** | Client → API (документ) | PDF/JPEG (неструктурированный) | Вредоносный файл, steganography, XSS | Проверка MIME‑type, антивирус‑скан, лимит ≤ 10 MB |
+| **6** | OCRSrv ← документ | Необработанное изображение | Оффлайн‑атака, скрытый код | Sandbox‑окружение, ограничение прав процесса OCR |
+| **7** | Classifier ← текст (Churn) | Свободный текст | Prompt‑injection, языковые атаки | Очистка/экранирование, whitelist‑словарей, ограничение длины |
+| **8** | External AML/KYC API → FeatureSrv | Внешний API‑ответ | Перехват / модификация | TLS, подпись API‑ключей, проверка хэша ответа |
 
 ---
 
 ### Краткие выводы и рекомендации бизнесу  
 
-1. **Флагман** готов к запуску в гибридном режиме (on‑prem модель + правила). Порог автоматизации «accept < 0.45», «reject > 0.90», «зазор 0.45‑0.55 → human‑review» держит **FP ≈ 4‑5 %**, **FN ≤ 1 %**.  
-2. **OCR‑оцифровка** реализована полностью в периметре банка, что устраняет риск утечки персональных данных. При `confidence < 0.8` система привлекает оператора – 95 % документов проходят полностью автоматически.  
-3. **Прогноз оттока** (Churn) использует on‑prem XGBoost; low‑confidence прогнозы ( < 0.6 ) попадают в Human Review, что позволяет сохранять качество удержания без риска ошибочного отклонения VIP‑клиентов.  
-4. **Мониторинг** покрывает все уровни – от входных запросов до бизнес‑метрик – и автоматизирует откат модели при обнаружении data‑drift.  
-5. **Угрозы** привязаны к конкретным границам доверия, а меры снижения риска (TLS, HMAC, sandbox, валидация схем) реализованы в инфраструктуре без перегрузки диаграмм.  
+| Пункт | Вывод |
+|-------|-------|
+| **Модель** | **Только приоритет** (riskScore + priorityScore).  Нет автоматических `reject`/`accept`. |
+| **Бизнес‑правила** | Остаются **единственным** источником окончательного решения; они могут переопределять модельный риск. |
+| **Human‑review** | Срабатывает при **низкой уверенности**, **OOD‑детекции**, **высоком приоритете** или **отсутствии признаков**. |
+| **Мониторинг** | Добавлен контроль `priorityScoreDistribution` и `oodDetectionRate`. |
+| **Риски** | Привязаны к границам доверия (пунктирные линии).  Меры (TLS, HMAC, sandbox, валидация) уже реализованы. |
+| **Тестирование** | Пилотный запуск в режиме **shadow‑mode**: модель генерирует приоритет, но решения принимаются только правилами и human‑review.  После подтверждения KPI (корректность приоритета, отсутствие роста FN) – полное включение модели в прод. |
