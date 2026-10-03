@@ -48,7 +48,6 @@ Rel(Rules, Db, "store decision history")
 
 ```mermaid
 C4Container
-C4Container
 title RetailBank – Компоненты AI‑сервиса (Флагман)
 
 Container_Boundary(ai, "AI Service") {
