@@ -29,8 +29,8 @@ System_Boundary(rb, "RetailBank Core") {
 System_Boundary(ai, "AI Service") {
     Container(Queue, "Message Queue", "Kafka", "Буфер запросов")
     Container(FeatureSrv, "Feature Extraction Service", "Java/Scala", "Формирование детерминированных признаков")
-    Container(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Расчёт `riskScore` (0‑1) и `priorityScore` (0‑100)")
-    Container(Rules, "Deterministic Rules Engine", "Drools", "Бизнес‑правила AML (не используют пороги модели)")
+    Container(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Расчёт riskScore (0‑1) и priorityScore (0‑100). ТОЛЬКО приоритет, не принимает решений.")
+    Container(Rules, "Deterministic Rules Engine", "Drools", "Бизнес‑правила AML. Единственный источник автоматических accept/reject. При priorityScore > 80 → только hold.")
     Container(HumanUI, "Human Review UI", "React", "Экран аналитика")
 }
 Rel(customer, API, "Отправка операции")
@@ -39,14 +39,15 @@ Rel(Queue, FeatureSrv, "Consume")
 Rel(FeatureSrv, Db, "Read ops + справочники")
 Rel(FeatureSrv, KYC, "Pull risk signals")
 Rel(FeatureSrv, ScoreModel, "JSON‑features")
-Rel(ScoreModel, Rules, "riskScore + priorityScore")
-Rel(Rules, API, "finalDecision (accept / reject / hold)")
-Rel(Rules, HumanUI, "hold / low‑confidence → запрос проверки")
-Rel(HumanUI, API, "humanVerdict")
+Rel(ScoreModel, Rules, "riskScore, priorityScore (только приоритет)")
+Rel(Rules, API, "finalDecision (accept / reject / hold), decisionSource")
+Rel(Rules, HumanUI, "priorityScore > 80, gap [70‑80], low confidence, OOD, missing features → запрос проверки")
+Rel(HumanUI, Rules, "humanVerdict (accept / reject / pending)")
 Rel(Rules, Db, "store decision history")
 ```
 
 ```mermaid
+C4Container
 C4Container
 title RetailBank – Компоненты AI‑сервиса (Флагман)
 
@@ -54,24 +55,27 @@ Container_Boundary(ai, "AI Service") {
     Component(API, "REST API `/risk‑check`", "Spring/Node", "Приём запросов, валидация JSON")
     Component(Queue, "Message Queue", "Kafka", "Буфер запросов")
     Component(FeatureExtractor, "Feature Extraction", "Java/Scala", "Сбор и агрегирование признаков")
-    Component(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Выдаёт `riskScore` (0‑1) и `priorityScore` (0‑100)")
-    Component(RulesEngine, "Rules Engine", "Drools", "Бизнес‑правила AML (полностью детерминированы)")
-    Component(HumanRouter, "Human Review Trigger", "Java", "Определяет необходимость human‑in‑the‑loop (low‑confidence, OOD, priority > 80)")
+    Component(ScoreModel, "ML Scoring Model", "Python (LightGBM)", "Выдаёт riskScore (0‑1) и priorityScore (0‑100). ТОЛЬКО приоритет, не принимает решений reject/accept.")
+    Component(RulesEngine, "Rules Engine", "Drools", "Бизнес‑правила AML (полностью детерминированы). Единственный источник автоматических accept/reject. При priorityScore > 80 → только hold.")
+    Component(HumanRouter, "Human Review Trigger", "Java", "Определяет необходимость human‑in‑the‑loop: priorityScore > 80, gap [70‑80], low confidence, OOD, missing features")
     Component(HumanUI, "Human Review UI", "React", "Экран аналитика")
+    Component(DecisionLogger, "Decision Logger", "PostgreSQL", "Единый журнал всех решений: accept / reject / hold / pending")
     Component(Monitoring, "Monitoring", "Prometheus/Loki", "Метрики, алерты, трассировка")
 }
 Rel(API, Queue, "enqueue request")
 Rel(Queue, FeatureExtractor, "consume")
 Rel(FeatureExtractor, ScoreModel, "features JSON")
-Rel(ScoreModel, RulesEngine, "riskScore + priorityScore")
+Rel(ScoreModel, RulesEngine, "riskScore, priorityScore, confidence")
 Rel(RulesEngine, HumanRouter, "hold? / low‑confidence / priority")
-Rel(HumanRouter, HumanUI, "display for review")
-Rel(HumanUI, RulesEngine, "humanVerdict")
-Rel(RulesEngine, API, "finalDecision")
+Rel(HumanRouter, HumanUI, "display for review (humanReviewReason)")
+Rel(HumanUI, RulesEngine, "humanVerdict (accept / reject / pending), analystId, comment")
+Rel(RulesEngine, DecisionLogger, "write decision + decisionSource")
+Rel(RulesEngine, API, "finalDecision (accept / reject / hold), decisionSource")
 Rel(Monitoring, FeatureExtractor, "metrics")
 Rel(Monitoring, ScoreModel, "metrics")
 Rel(Monitoring, RulesEngine, "metrics")
 Rel(Monitoring, HumanUI, "metrics")
+
 ```
 
 #### Инициатива A – OCR‑оцифровка документов к кредитной заявке  
@@ -117,19 +121,20 @@ System_Boundary(rb, "RetailBank Core") {
 }
 System_Boundary(aiChurn, "AI Service – Churn (on‑prem)") {
     Container(ETL, "ETL / Feature Builder", "Spark / SQL", "Генерирует набор признаков за 24 ч")
-    Container(ChurnModel, "Batch ML Model", "Python (XGBoost)", "Обучает/прогнозирует отток")
-    Container(PredTable, "Churn Predictions Table", "PostgreSQL", "Хранит `churnProbability`, `confidence`")
-    Container(Rules, "Deterministic Rules Engine", "Drools", "Правила бизнес‑приоритетов (VIP, регуляция)")
-    Container(HumanUI, "Human Review UI – Churn", "React", "Экран аналитика: список low‑confidence")
+    Container(ChurnModel, "Batch ML Model", "Python (XGBoost)", "Прогнозирует churnProbability и confidence. ТОЛЬКО прогноз, не принимает решений.")
+    Container(PredTable, "Churn Predictions Table", "PostgreSQL", "Хранит churnProbability, confidence")
+    Container(Rules, "Deterministic Rules Engine", "Drools", "Правила бизнес‑приоритетов (VIP, регуляция). Единственный источник решений.")
+    Container(HumanUI, "Human Review UI – Churn", "React", "Экран аналитика: список low‑confidence (confidence < 0.6) и правило‑override")
 }
 Rel(analyst, Scheduler, "Запускает batch‑job (daily)")
 Rel(Scheduler, ETL, "trigger")
 Rel(ETL, Db, "читает клиентские события")
 Rel(ETL, ChurnModel, "передаёт признаки")
-Rel(ChurnModel, PredTable, "записывает прогноз")
-Rel(PredTable, Rules, "чтение прогнозов")
-Rel(Rules, HumanUI, "hold / low‑confidence → список для review")
-Rel(HumanUI, Db, "записывает действия retention")
+Rel(ChurnModel, PredTable, "записывает churnProbability, confidence")
+Rel(PredTable, Rules, "чтение churnProbability, confidence")
+Rel(Rules, HumanUI, "confidence < 0.6 или правило‑override → список для review")
+Rel(HumanUI, Rules, "humanVerdict (accept / reject / pending)")
+Rel(HumanUI, Db, "записывает действия retention + humanVerdict")
 ```
 ---
 
